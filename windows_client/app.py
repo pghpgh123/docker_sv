@@ -1,3 +1,4 @@
+import os
 import json
 import queue
 import threading
@@ -10,13 +11,14 @@ import requests
 import sounddevice as sd
 import soundfile as sf
 import websocket
-from PySide6.QtCore import QThread, Signal, Qt
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import QThread, Signal, Qt, QTimer
+from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
     QHeaderView,
@@ -141,9 +143,42 @@ class WsWorker(QThread):
 
 
 class MainWindow(QMainWindow):
+    sig_rtsp_stream_message = Signal(dict)
+    sig_rtsp_stream_log = Signal(str)
+    sig_rtsp_stream_finished = Signal()
+
+    CONFIG_PATH = os.path.expanduser("~/.sv_client_config.json")
+    RTSP_STRATEGIES = [
+        ("conservative", "保守RTSP"),
+        ("adaptive", "自适应VAD（近麦克风）"),
+        ("mirror_mic", "完全同麦克风"),
+    ]
+
+    def _init_rtsp_stream_vars(self) -> None:
+        self.rtsp_stream_ws = None
+        self.rtsp_stream_thread = None
+        self.rtsp_stream_running = False
+        self.rtsp_seq_base = 0
+        self.rtsp_display_current_seq: Optional[int] = None
+        self.rtsp_display_current_text = ""
+        self.rtsp_display_last_full_text = ""
+        self.rtsp_display_history: list[str] = []
+        self.rtsp_display_last_activity_ts = 0.0
+        self.rtsp_pending_final_text = ""
+        self.rtsp_pending_final_from_server = False
+        self.rtsp_last_closed_seq: Optional[int] = None
+        self.rtsp_closed_seq_queue: list[int] = []
+        self.rtsp_idle_dot_phase = 0
+        self.rtsp_idle_wait_logged = False
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("SenseVoice 联调客户端")
+
+        # 默认窗口为1600x900，适配125%缩放下的1920x1080屏幕
+        self.setMinimumSize(1024, 600)
+        self.setMaximumSize(1920, 1080)
+        self.resize(1600, 900)
 
         self.ws_worker: Optional[WsWorker] = None
         self.endpoints: Optional[ServerEndpoints] = None
@@ -168,9 +203,292 @@ class MainWindow(QMainWindow):
         self.main_splitter = QSplitter(Qt.Vertical)
         self.bottom_splitter = QSplitter(Qt.Horizontal)
         self._build_ui()
-        # 必须在 _build_ui() 完成后再调用布局调整，否则 main_splitter 未初始化
+        self._init_rtsp_stream_vars()
+        self.sig_rtsp_stream_message.connect(self._on_rtsp_stream_message)
+        self.sig_rtsp_stream_log.connect(self.log)
+        self.sig_rtsp_stream_finished.connect(self._on_rtsp_stream_finished)
+        self.rtsp_partial_timer = QTimer(self)
+        self.rtsp_partial_timer.setInterval(350)
+        self.rtsp_partial_timer.timeout.connect(self._on_rtsp_partial_tick)
+        self.copy_shortcut = QShortcut(QKeySequence.Copy, self)
+        self.copy_shortcut.activated.connect(self._copy_active_table_selection)
         self._apply_1080p_preset_layout()
         self._load_input_devices()
+        self._load_user_config()
+
+        self.base_url_edit.textChanged.connect(lambda _text: self._save_user_config())
+        self.rtsp_url_edit.textChanged.connect(lambda _text: self._save_user_config())
+        self.rtsp_strategy_combo.currentIndexChanged.connect(lambda _idx: self._save_user_config())
+        self.rtsp_min_rms_spin.valueChanged.connect(lambda _value: self._save_user_config())
+        self.wav_path_edit.textChanged.connect(lambda _text: self._save_user_config())
+
+    def on_rtsp_stream_start(self) -> None:
+        if self.rtsp_stream_running:
+            return
+        rtsp_url = self.rtsp_url_edit.text().strip()
+        if not rtsp_url.startswith("rtsp://"):
+            QMessageBox.warning(self, "无效地址", "请输入合法的RTSP地址")
+            return
+        if not self.endpoints:
+            QMessageBox.warning(self, "未连接", "请先连接服务器")
+            return
+        self._save_user_config()
+        current_max_seq = 0
+        if self._partial_seq_order:
+            current_max_seq = max(current_max_seq, max(self._partial_seq_order))
+        if self._final_seq_order:
+            current_max_seq = max(current_max_seq, max(self._final_seq_order))
+        self.rtsp_seq_base = current_max_seq
+        self.rtsp_display_current_seq = None
+        self.rtsp_display_current_text = ""
+        self.rtsp_display_last_full_text = ""
+        self.rtsp_display_history = []
+        self.rtsp_display_last_activity_ts = 0.0
+        self.rtsp_pending_final_text = ""
+        self.rtsp_pending_final_from_server = False
+        self.rtsp_last_closed_seq = None
+        self.rtsp_closed_seq_queue = []
+        self.rtsp_idle_dot_phase = 0
+        self.rtsp_idle_wait_logged = False
+        self._start_new_rtsp_display_sentence(initial=True)
+        self.rtsp_partial_timer.start()
+        ws_url = self.endpoints.ws_url.replace("/ws/transcribe", "/ws/rtsp_transcribe")
+        self.rtsp_stream_running = True
+        self.rtsp_stream_thread = threading.Thread(
+            target=self._rtsp_stream_worker,
+            args=(ws_url, rtsp_url, self._current_rtsp_strategy(), self.rtsp_min_rms_spin.value()),
+            daemon=True,
+        )
+        self.rtsp_stream_thread.start()
+        self.rtsp_stream_start_btn.setEnabled(False)
+        self.rtsp_stream_stop_btn.setEnabled(True)
+        self.log(
+            f"[RTSP流式] 已启动，策略={self._current_rtsp_strategy_label()}，最小RMS={self.rtsp_min_rms_spin.value():.3f}"
+        )
+
+    def on_rtsp_stream_stop(self) -> None:
+        self.rtsp_stream_running = False
+        self.rtsp_partial_timer.stop()
+        if self.rtsp_stream_ws:
+            try:
+                self.rtsp_stream_ws.close()
+            except Exception:
+                pass
+        self.rtsp_stream_start_btn.setEnabled(True)
+        self.rtsp_stream_stop_btn.setEnabled(False)
+        self.log("[RTSP流式] 已停止")
+
+    def _start_new_rtsp_display_sentence(self, initial: bool = False) -> None:
+        next_seq = self.rtsp_seq_base + 1
+        if self._partial_seq_order:
+            next_seq = max(next_seq, max(self._partial_seq_order) + 1)
+        if self._final_seq_order:
+            next_seq = max(next_seq, max(self._final_seq_order) + 1)
+        self.rtsp_display_current_seq = next_seq
+        self.rtsp_display_current_text = ""
+        self.rtsp_display_last_full_text = ""
+        self.rtsp_display_history = []
+        self.rtsp_display_last_activity_ts = time.monotonic()
+        self.rtsp_pending_final_text = ""
+        self.rtsp_pending_final_from_server = False
+        self.rtsp_idle_dot_phase = 0
+        self.rtsp_idle_wait_logged = False
+        if next_seq not in self._partial_seq_order:
+            self._partial_seq_order.append(next_seq)
+        self._upsert_partial_row(next_seq, "")
+        if initial:
+            self.log(f"[RTSP流式] 初始化实时句子 seq={next_seq}")
+        else:
+            self.log(f"[RTSP流式] 开始下一条实时句子 seq={next_seq}")
+
+    def _rtsp_stream_worker(self, ws_url: str, rtsp_url: str, rtsp_strategy: str, rtsp_min_rms: float) -> None:
+        try:
+            ws = websocket.create_connection(ws_url, timeout=5)
+            ws.settimeout(1.0)
+            self.rtsp_stream_ws = ws
+            ws.send(
+                json.dumps(
+                    {
+                        "rtsp_url": rtsp_url,
+                        "rtsp_strategy": rtsp_strategy,
+                        "rtsp_min_rms": float(rtsp_min_rms),
+                    }
+                )
+            )
+            while self.rtsp_stream_running:
+                try:
+                    msg = ws.recv()
+                    data = json.loads(msg)
+                    error = str(data.get("error", "")).strip()
+                    if error:
+                        self.sig_rtsp_stream_log.emit(f"[RTSP流式] 服务端错误: {error}")
+                        break
+                    self.sig_rtsp_stream_message.emit(data)
+                except websocket.WebSocketTimeoutException:
+                    continue
+                except Exception as exc:
+                    if self.rtsp_stream_running:
+                        self.sig_rtsp_stream_log.emit(f"[RTSP流式] 异常: {exc}")
+                    break
+        except Exception as exc:
+            self.sig_rtsp_stream_log.emit(f"[RTSP流式] 连接失败: {exc}")
+        finally:
+            self.rtsp_stream_running = False
+            if self.rtsp_stream_ws:
+                try:
+                    self.rtsp_stream_ws.close()
+                except Exception:
+                    pass
+            self.rtsp_stream_ws = None
+            self.sig_rtsp_stream_finished.emit()
+
+    def _on_rtsp_stream_message(self, payload: dict) -> None:
+        mtype = payload.get("type")
+        text = str(payload.get("text", "")).strip()
+        if mtype in ("partial", "final") and text:
+            self.log(f"[RTSP流式][{mtype}] seq={payload.get('seq')} text={text}")
+        self._handle_asr_payload(payload, source_label="RTSP流式")
+
+    def _copy_active_table_selection(self) -> None:
+        widget = QApplication.focusWidget()
+        while widget is not None and widget not in (self.partial_table, self.final_table):
+            widget = widget.parentWidget()
+
+        if widget not in (self.partial_table, self.final_table):
+            return
+
+        table = widget
+        selected = table.selectedRanges()
+        if not selected:
+            return
+
+        label = "实时文本：" if table == self.partial_table else "最终文本："
+        lines = []
+        seen_rows = set()
+        for rng in selected:
+            for row in range(rng.topRow(), rng.bottomRow() + 1):
+                if row in seen_rows:
+                    continue
+                seen_rows.add(row)
+                text_item = table.item(row, 1)
+                text = text_item.text() if text_item else ""
+                lines.append(f"{label}{text}")
+        QApplication.clipboard().setText("\n".join(lines))
+        self.log("已复制表格选中内容")
+
+    def _on_rtsp_stream_finished(self) -> None:
+        self.rtsp_partial_timer.stop()
+        self.rtsp_stream_start_btn.setEnabled(True)
+        self.rtsp_stream_stop_btn.setEnabled(False)
+
+    def _commit_rtsp_final_row(self, seq_i: int, text: str) -> None:
+        if seq_i not in self._final_seq_order:
+            self._final_seq_order.append(seq_i)
+        self._final_lines_by_seq[seq_i] = text
+        self._upsert_final_row(seq_i, text, allow_confirm=False)
+
+    def _handle_rtsp_server_final(self, text: str) -> None:
+        final_text = str(text).strip()
+        if self.rtsp_closed_seq_queue:
+            target_seq = self.rtsp_closed_seq_queue.pop(0)
+            self.log(f"[RTSP流式][final-apply] seq={target_seq} text={final_text or '<empty>'}")
+            self._commit_rtsp_final_row(target_seq, final_text)
+            if self.rtsp_last_closed_seq == target_seq:
+                self.rtsp_last_closed_seq = None
+            return
+
+        if self.rtsp_display_current_seq is not None and self.rtsp_display_current_text.strip():
+            self.rtsp_pending_final_text = final_text
+            self.rtsp_pending_final_from_server = True
+            self.log(
+                f"[RTSP流式][final-buffered] seq={self.rtsp_display_current_seq} text={final_text or '<empty>'}"
+            )
+            return
+
+        self.log(f"[RTSP流式][final-drop] text={final_text or '<empty>'}")
+
+    def _on_rtsp_partial_tick(self) -> None:
+        if not self.rtsp_stream_running or self.rtsp_display_current_seq is None:
+            return
+
+        seq_i = self.rtsp_display_current_seq
+        elapsed_ms = max(0.0, (time.monotonic() - self.rtsp_display_last_activity_ts) * 1000)
+        if not self.rtsp_display_current_text:
+            self.rtsp_idle_dot_phase = (self.rtsp_idle_dot_phase % 3) + 1
+            animated = "." * self.rtsp_idle_dot_phase
+            self._upsert_partial_row(seq_i, animated)
+            if not self.rtsp_idle_wait_logged:
+                self.log(f"[RTSP流式][waiting] seq={seq_i}")
+                self.rtsp_idle_wait_logged = True
+            return
+
+        self.rtsp_idle_wait_logged = False
+        self.rtsp_idle_dot_phase = (self.rtsp_idle_dot_phase % 3) + 1
+        animated = f"{self.rtsp_display_current_text}{'.' * self.rtsp_idle_dot_phase}"
+        self._upsert_partial_row(seq_i, animated)
+
+        if elapsed_ms < self.vad_end_ms_spin.value():
+            return
+
+        if self.rtsp_pending_final_from_server:
+            final_text = self.rtsp_pending_final_text.strip()
+            should_wait_server_final = False
+        else:
+            final_text = self.rtsp_display_last_full_text.strip() or self.rtsp_display_current_text.strip()
+            should_wait_server_final = True
+        self.log(f"[RTSP流式][sentence-end] seq={seq_i} final={final_text or '<empty>'}")
+        if not should_wait_server_final and final_text:
+            self._commit_rtsp_final_row(seq_i, final_text)
+        if should_wait_server_final and seq_i not in self.rtsp_closed_seq_queue:
+            self.rtsp_closed_seq_queue.append(seq_i)
+        self.rtsp_last_closed_seq = seq_i
+        self.rtsp_pending_final_text = ""
+        self.rtsp_pending_final_from_server = False
+        self._start_new_rtsp_display_sentence(initial=False)
+
+    def _save_user_config(self) -> None:
+        cfg = {
+            "base_url": self.base_url_edit.text().strip(),
+            "rtsp_url": self.rtsp_url_edit.text().strip(),
+            "rtsp_strategy": self._current_rtsp_strategy(),
+            "rtsp_min_rms": float(self.rtsp_min_rms_spin.value()),
+            "wav_path": self.wav_path_edit.text().strip(),
+        }
+        try:
+            with open(self.CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _load_user_config(self) -> None:
+        try:
+            if os.path.exists(self.CONFIG_PATH):
+                with open(self.CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                if "base_url" in cfg:
+                    self.base_url_edit.setText(cfg["base_url"])
+                if "rtsp_url" in cfg:
+                    self.rtsp_url_edit.setText(cfg["rtsp_url"])
+                if "rtsp_strategy" in cfg:
+                    self._set_rtsp_strategy(cfg["rtsp_strategy"])
+                if "rtsp_min_rms" in cfg:
+                    self.rtsp_min_rms_spin.setValue(float(cfg["rtsp_min_rms"]))
+                if "wav_path" in cfg:
+                    self.wav_path_edit.setText(cfg["wav_path"])
+        except Exception:
+            pass
+
+    def _current_rtsp_strategy(self) -> str:
+        value = self.rtsp_strategy_combo.currentData()
+        return str(value or "conservative")
+
+    def _current_rtsp_strategy_label(self) -> str:
+        return self.rtsp_strategy_combo.currentText().strip() or "保守RTSP"
+
+    def _set_rtsp_strategy(self, value: str) -> None:
+        idx = self.rtsp_strategy_combo.findData(value)
+        if idx >= 0:
+            self.rtsp_strategy_combo.setCurrentIndex(idx)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -336,8 +654,8 @@ class MainWindow(QMainWindow):
         self.partial_table.setHorizontalHeaderLabels(["序号", "实时文本"])
         self.partial_table.verticalHeader().setVisible(False)
         self.partial_table.horizontalHeader().setVisible(False)
-        self.partial_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.partial_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.partial_table.setSelectionBehavior(QAbstractItemView.SelectItems)
+        self.partial_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.partial_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.partial_table.setShowGrid(True)
         partial_header = self.partial_table.horizontalHeader()
@@ -349,8 +667,8 @@ class MainWindow(QMainWindow):
         self.final_table.setHorizontalHeaderLabels(["序号", "最终文本", "确认"])
         self.final_table.verticalHeader().setVisible(False)
         self.final_table.horizontalHeader().setVisible(False)
-        self.final_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.final_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.final_table.setSelectionBehavior(QAbstractItemView.SelectItems)
+        self.final_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.final_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.final_table.setShowGrid(True)
         final_header = self.final_table.horizontalHeader()
@@ -476,16 +794,36 @@ class MainWindow(QMainWindow):
         self.rtsp_url_edit = QLineEdit()
         self.rtsp_url_edit.setPlaceholderText("rtsp://...")
         self.rtsp_url_edit.setMinimumWidth(260)
-        self.rtsp_recognize_btn = QPushButton("识别")
+        self.rtsp_strategy_combo = QComboBox()
+        for value, label in self.RTSP_STRATEGIES:
+            self.rtsp_strategy_combo.addItem(label, value)
+        self.rtsp_strategy_combo.setMinimumHeight(CONTROL_MIN_HEIGHT)
+        self.rtsp_min_rms_spin = QDoubleSpinBox()
+        self.rtsp_min_rms_spin.setDecimals(3)
+        self.rtsp_min_rms_spin.setRange(0.0, 0.200)
+        self.rtsp_min_rms_spin.setSingleStep(0.002)
+        self.rtsp_min_rms_spin.setValue(0.012)
+        self.rtsp_min_rms_spin.setMinimumHeight(CONTROL_MIN_HEIGHT)
+        # self.rtsp_recognize_btn = QPushButton("单次识别")
+        self.rtsp_stream_start_btn = QPushButton("流式识别开始")
+        self.rtsp_stream_stop_btn = QPushButton("停止")
+        self.rtsp_stream_stop_btn.setEnabled(False)
         rtsp_layout.addWidget(QLabel("RTSP地址"), 0, 0)
         rtsp_layout.addWidget(self.rtsp_url_edit, 0, 1)
-        rtsp_layout.addWidget(self.rtsp_recognize_btn, 0, 2)
-        # 让地址编辑框占据更多水平空间
+        rtsp_layout.addWidget(QLabel("策略"), 1, 0)
+        rtsp_layout.addWidget(self.rtsp_strategy_combo, 1, 1)
+        rtsp_layout.addWidget(QLabel("最小RMS"), 2, 0)
+        rtsp_layout.addWidget(self.rtsp_min_rms_spin, 2, 1)
+        # rtsp_layout.addWidget(self.rtsp_recognize_btn, 0, 2)
+        rtsp_layout.addWidget(self.rtsp_stream_start_btn, 0, 3)
+        rtsp_layout.addWidget(self.rtsp_stream_stop_btn, 0, 4)
         rtsp_layout.setColumnStretch(0, 0)
         rtsp_layout.setColumnStretch(1, 5)
         rtsp_layout.setColumnStretch(2, 0)
-        rtsp_box.setMinimumHeight(60)
-        rtsp_box.setMaximumHeight(60)
+        rtsp_layout.setColumnStretch(3, 0)
+        rtsp_layout.setColumnStretch(4, 0)
+        rtsp_box.setMinimumHeight(116)
+        rtsp_box.setMaximumHeight(116)
 
         top_row = QHBoxLayout()
         top_row.setContentsMargins(0, 0, 0, 0)
@@ -547,34 +885,13 @@ class MainWindow(QMainWindow):
         self.clear_final_btn.clicked.connect(self.on_clear_final)
         self.clear_log_btn.clicked.connect(self.log_text.clear)
         self.final_table.itemChanged.connect(self.on_final_table_item_changed)
-        self.rtsp_recognize_btn.clicked.connect(self.on_rtsp_recognize)
+        # self.rtsp_recognize_btn.clicked.connect(self.on_rtsp_recognize)
+        self.rtsp_stream_start_btn.clicked.connect(self.on_rtsp_stream_start)
+        self.rtsp_stream_stop_btn.clicked.connect(self.on_rtsp_stream_stop)
 
         self._set_rules_to_table([("寨上", "站上"), ("三脚痛", "三角筒"), ("新判断", "请判断")])
 
-    def on_rtsp_recognize(self) -> None:
-        rtsp_url = self.rtsp_url_edit.text().strip()
-        if not rtsp_url.startswith("rtsp://"):
-            QMessageBox.warning(self, "无效地址", "请输入合法的RTSP地址")
-            return
-        if not self.endpoints:
-            QMessageBox.warning(self, "未连接", "请先连接服务器")
-            return
-        self.log(f"发送RTSP识别请求: {rtsp_url}")
-        try:
-            resp = requests.post(f"{self.endpoints.base_http}/ingest/rtsp", json={"rtsp_url": rtsp_url}, timeout=60)
-            if resp.status_code == 200:
-                data = resp.json()
-                self.log(f"RTSP识别任务已完成: {data}")
-                text = str(data.get("text", "")).strip()
-                if text:
-                    # 将结果追加到最终文本框中
-                    self._append_local_final_row(text)
-            else:
-                self.log(f"RTSP识别请求失败: {resp.text}")
-                QMessageBox.critical(self, "识别失败", f"服务器返回: {resp.text}")
-        except Exception as exc:
-            self.log(f"RTSP识别异常: {exc}")
-            QMessageBox.critical(self, "异常", str(exc))
+
 
     def _apply_1080p_preset_layout(self) -> None:
         screen = QGuiApplication.primaryScreen()
@@ -769,6 +1086,7 @@ class MainWindow(QMainWindow):
         self.log("输入设备已刷新")
 
     def on_connect(self) -> None:
+        self._save_user_config()
         try:
             self.endpoints = build_endpoints(self.base_url_edit.text())
         except Exception as exc:
@@ -807,12 +1125,33 @@ class MainWindow(QMainWindow):
         self.log(msg)
 
     def _on_ws_message(self, payload: dict) -> None:
+        self._handle_asr_payload(payload, source_label="麦克风")
+
+    def _handle_asr_payload(self, payload: dict, source_label: str) -> None:
         mtype = payload.get("type")
         if mtype == "partial":
             text = payload.get("text", "")
             seq = payload.get("seq")
             if seq is not None:
                 seq_i = int(seq)
+                if source_label == "RTSP流式":
+                    if self.rtsp_display_current_seq is None:
+                        self._start_new_rtsp_display_sentence(initial=True)
+                    piece = str(text).strip()
+                    prev_piece = self.rtsp_display_last_full_text
+                    if piece and piece != prev_piece:
+                        if not self.rtsp_display_history or self.rtsp_display_history[-1] != piece:
+                            self.rtsp_display_history.append(piece)
+                        self.rtsp_display_current_text = "...".join(self.rtsp_display_history)
+                    self.rtsp_display_last_full_text = piece
+                    if not self.rtsp_display_current_text:
+                        self.rtsp_display_current_text = piece
+                    self.rtsp_display_last_activity_ts = time.monotonic()
+                    self.rtsp_idle_dot_phase = 0
+                    self.rtsp_idle_wait_logged = False
+                    if self.rtsp_display_current_text:
+                        self._upsert_partial_row(self.rtsp_display_current_seq, self.rtsp_display_current_text)
+                    return
                 if seq_i not in self._partial_history_by_seq:
                     self._partial_seq_order.append(seq_i)
                     self._partial_history_by_seq[seq_i] = []
@@ -842,6 +1181,9 @@ class MainWindow(QMainWindow):
         elif mtype == "final":
             text = payload.get("text", "")
             seq = payload.get("seq")
+            if source_label == "RTSP流式":
+                self._handle_rtsp_server_final(str(text))
+                return
             if text:
                 if seq is not None:
                     seq_i = int(seq)
@@ -855,15 +1197,15 @@ class MainWindow(QMainWindow):
             mode = payload.get("mode", "balanced")
             vad_end_ms = payload.get("vad_end_ms")
             min_seg = payload.get("vad_min_segment_ms")
-            self.log(f"服务端自动模式: {mode}, 断句静音={vad_end_ms}ms, 最小语音段={min_seg}ms")
+            self.log(f"[{source_label}] 服务端自动模式: {mode}, 断句静音={vad_end_ms}ms, 最小语音段={min_seg}ms")
         elif mtype == "ready":
             self.current_session_id = payload.get("session_id", "")
             self.session_id_label.setText(self.current_session_id or "-")
-            self.log(json.dumps(payload, ensure_ascii=False))
+            self.log(f"[{source_label}] {json.dumps(payload, ensure_ascii=False)}")
         elif mtype in ("started", "stopped", "warning", "error"):
-            self.log(json.dumps(payload, ensure_ascii=False))
+            self.log(f"[{source_label}] {json.dumps(payload, ensure_ascii=False)}")
         else:
-            self.log(f"message: {payload}")
+            self.log(f"[{source_label}] message: {payload}")
 
     def _ws_send_json(self, payload: dict) -> bool:
         if self.ws_worker is None:
@@ -887,12 +1229,6 @@ class MainWindow(QMainWindow):
             row = self.partial_table.rowCount()
             self.partial_table.insertRow(row)
             self._partial_row_by_seq[seq_i] = row
-
-            # Keep both sides with the same row count/order to avoid bottom misalignment.
-            if seq_i not in self._final_row_by_seq:
-                if seq_i not in self._final_seq_order:
-                    self._final_seq_order.append(seq_i)
-                self._upsert_final_row(seq_i, "", allow_confirm=False)
 
         seq_item = QTableWidgetItem(str(seq_i))
         seq_item.setFlags(seq_item.flags() & ~Qt.ItemIsEditable)
@@ -1110,6 +1446,7 @@ class MainWindow(QMainWindow):
         file_path, _ = QFileDialog.getOpenFileName(self, "选择 WAV 文件", "", "WAV Files (*.wav)")
         if file_path:
             self.wav_path_edit.setText(file_path)
+            self._save_user_config()
 
     def on_upload_wav_http(self) -> None:
         if self.endpoints is None:
@@ -1146,6 +1483,11 @@ class MainWindow(QMainWindow):
                 self.log(f"上传异常: {exc}")
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def closeEvent(self, event) -> None:
+        self.on_rtsp_stream_stop()
+        self.on_disconnect()
+        super().closeEvent(event)
 
     def on_load_rewrite(self) -> None:
         if self.endpoints is None:

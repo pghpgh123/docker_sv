@@ -20,10 +20,10 @@ from pydantic import BaseModel
 from .asr_engine import SenseVoiceEngine
 from .settings import settings
 from .vad import FrameVadSegmenter
-from .rtsp_ingest import router as rtsp_router
+from .rtsp_ws import router as rtsp_ws_router
 
 app = FastAPI(title=settings.app_name)
-app.include_router(rtsp_router)
+app.include_router(rtsp_ws_router)
 
 
 class RewriteUpdateRequest(BaseModel):
