@@ -1,0 +1,35 @@
+services:
+  sensevoice_server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: sensevoice_server
+    ports:
+      - "19000:19000"
+    environment:
+      - APP_HOST=0.0.0.0
+      - APP_PORT=19000
+      - SENSEVOICE_MODEL=iic/SenseVoiceSmall
+      - SENSEVOICE_DEVICE=cuda:0
+      - SENSEVOICE_FALLBACK_TO_CPU=true
+      - SENSEVOICE_LANGUAGE=zh
+      - SENSEVOICE_HOTWORDS=站上 三角筒 荧光衣 佩戴
+      - SENSEVOICE_TEXT_REWRITE=寨上=>站上;三脚痛=>三角筒;新判断=>请判断
+      - SENSEVOICE_REWRITE_FILE=/app/config/rewrite_rules.txt
+      - SENSEVOICE_USE_ITN=true
+      - SENSEVOICE_BATCH_SIZE_S=60
+      - VAD_AGGRESSIVENESS=1
+      - VAD_FRAME_MS=20
+      - VAD_START_TRIGGER_FRAMES=6
+      - VAD_END_TRIGGER_FRAMES=18
+      - VAD_MAX_SEGMENT_MS=15000
+      - VAD_MIN_SEGMENT_MS=1200
+      - VAD_AUTO_ADAPT_ENABLED=true
+      - VAD_AUTO_SPEECH_RMS_THRESHOLD=0.012
+      - PARTIAL_INTERVAL_SEC=1.6
+      - PARTIAL_MIN_AUDIO_MS=1800
+    volumes:
+      - ./models:/root/.cache/modelscope
+      - ./server/config:/app/config
+    gpus: all
+    restart: unless-stopped

@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(which tmux:*)",
+      "Bash(whoami && echo $HOME)",
+      "WebSearch",
+      "Bash(tmux ls:*)",
+      "Bash(tmux new-session:*)",
+      "Bash(tmux attach:*)",
+      "Bash(ip addr:*)",
+      "Bash(docker --version && docker compose version && nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>/dev/null || echo \"nvidia-smi失败\")",
+      "Read(//etc/iptables/**)",
+      "Bash(iptables -L -n)",
+      "Bash(pip config:*)",
+      "Read(//etc/**)",
+      "Bash(docker pull:*)",
+      "Bash(ssh -o ConnectTimeout=3 -p 30001 admin123@127.0.0.1 \"echo ok\" 2>&1 || echo \"需要密码或失败\")",
+      "Bash(ss -tlnp | grep -E \"22|30001\" && systemctl status ssh 2>/dev/null | head -5 || systemctl status sshd 2>/dev/null | head -5)",
+      "Read(//home/admin123/.ssh/**)",
+      "Bash(cd /home/pgh/work/docker_intercom && docker build -t intercom_funasr ./docker_intercom_funasr/ 2>&1)"
+    ]
+  }
+}
