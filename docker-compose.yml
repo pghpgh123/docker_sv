@@ -28,8 +28,17 @@ services:
       - VAD_AUTO_SPEECH_RMS_THRESHOLD=0.012
       - PARTIAL_INTERVAL_SEC=1.6
       - PARTIAL_MIN_AUDIO_MS=1800
+      - FASTER_WHISPER_MODEL=${FASTER_WHISPER_MODEL:-large-v3}
+      - FASTER_WHISPER_DEVICE=${FASTER_WHISPER_DEVICE:-cuda}
+      - FASTER_WHISPER_COMPUTE_TYPE=${FASTER_WHISPER_COMPUTE_TYPE:-float16}
+      - FASTER_WHISPER_LANGUAGE=${FASTER_WHISPER_LANGUAGE:-zh}
+      - FASTER_WHISPER_BEAM_SIZE=${FASTER_WHISPER_BEAM_SIZE:-5}
+      - FASTER_WHISPER_SERVICE_URL=${FASTER_WHISPER_SERVICE_URL:-http://host.docker.internal:19100}
+      - FASTER_WHISPER_TIMEOUT_SEC=${FASTER_WHISPER_TIMEOUT_SEC:-180}
     volumes:
       - ./models:/root/.cache/modelscope
       - ./server/config:/app/config
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     gpus: all
     restart: unless-stopped

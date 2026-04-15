@@ -18,6 +18,14 @@ class AppSettings(BaseSettings):
     sensevoice_use_itn: bool = True
     sensevoice_batch_size_s: int = 60
 
+    faster_whisper_model: str = "large-v3"
+    faster_whisper_device: str = "cuda"
+    faster_whisper_compute_type: str = "float16"
+    faster_whisper_language: str = "zh"
+    faster_whisper_beam_size: int = 5
+    faster_whisper_service_url: str = ""
+    faster_whisper_timeout_sec: float = 180.0
+
     # VAD controls
     vad_aggressiveness: int = 1
     vad_frame_ms: int = 20

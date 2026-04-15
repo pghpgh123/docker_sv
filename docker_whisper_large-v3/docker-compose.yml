@@ -1,0 +1,24 @@
+services:
+  whisper_large_v3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: whisper_large_v3
+    ports:
+      - "19100:19100"
+    environment:
+      - APP_HOST=0.0.0.0
+      - APP_PORT=19100
+      - WHISPER_MODEL_REPO_ID=${WHISPER_MODEL_REPO_ID:-Systran/faster-whisper-large-v3}
+      - WHISPER_MODEL_DIR=${WHISPER_MODEL_DIR:-/models/faster-whisper-large-v3}
+      - WHISPER_DEVICE=${WHISPER_DEVICE:-cuda}
+      - WHISPER_COMPUTE_TYPE=${WHISPER_COMPUTE_TYPE:-float16}
+      - WHISPER_LANGUAGE=${WHISPER_LANGUAGE:-zh}
+      - WHISPER_BEAM_SIZE=${WHISPER_BEAM_SIZE:-5}
+      - WHISPER_PRELOAD=${WHISPER_PRELOAD:-true}
+      - WHISPER_AUTO_DOWNLOAD=${WHISPER_AUTO_DOWNLOAD:-true}
+      - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+    volumes:
+      - ./models:/models
+    gpus: all
+    restart: unless-stopped

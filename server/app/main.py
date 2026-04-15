@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from .asr_engine import SenseVoiceEngine
+from .final_asr_engine import FasterWhisperEngine
 from .settings import settings
 from .vad import FrameVadSegmenter
 from .rtsp_ws import router as rtsp_ws_router
@@ -255,6 +256,15 @@ async def startup_event() -> None:
         batch_size_s=settings.sensevoice_batch_size_s,
     )
     app.state.asr.load()
+    app.state.final_asr = FasterWhisperEngine(
+        model_name=settings.faster_whisper_model,
+        device=settings.faster_whisper_device,
+        compute_type=settings.faster_whisper_compute_type,
+        language=settings.faster_whisper_language,
+        beam_size=settings.faster_whisper_beam_size,
+        service_url=settings.faster_whisper_service_url,
+        request_timeout_sec=settings.faster_whisper_timeout_sec,
+    )
     app.state.mode_stats = AdaptiveModeStatsTracker(max_keep_hours=24)
     app.state.rewrite_learn_counts = {}
     app.state.rewrite_learn_threshold = 3

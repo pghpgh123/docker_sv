@@ -152,6 +152,7 @@ class MainWindow(QMainWindow):
         ("conservative", "保守RTSP"),
         ("adaptive", "自适应VAD（近麦克风）"),
         ("mirror_mic", "完全同麦克风"),
+        ("final_whisper", "Whisper large-v3（仅最终文本）"),
     ]
 
     def _init_rtsp_stream_vars(self) -> None:
@@ -250,8 +251,10 @@ class MainWindow(QMainWindow):
         self.rtsp_closed_seq_queue = []
         self.rtsp_idle_dot_phase = 0
         self.rtsp_idle_wait_logged = False
-        self._start_new_rtsp_display_sentence(initial=True)
-        self.rtsp_partial_timer.start()
+        final_only_mode = self._current_rtsp_strategy() == "final_whisper"
+        if not final_only_mode:
+            self._start_new_rtsp_display_sentence(initial=True)
+            self.rtsp_partial_timer.start()
         ws_url = self.endpoints.ws_url.replace("/ws/transcribe", "/ws/rtsp_transcribe")
         self.rtsp_stream_running = True
         self.rtsp_stream_thread = threading.Thread(
@@ -387,7 +390,7 @@ class MainWindow(QMainWindow):
         self._final_lines_by_seq[seq_i] = text
         self._upsert_final_row(seq_i, text, allow_confirm=False)
 
-    def _handle_rtsp_server_final(self, text: str) -> None:
+    def _handle_rtsp_server_final(self, text: str, seq: Optional[int] = None) -> None:
         final_text = str(text).strip()
         if self.rtsp_closed_seq_queue:
             target_seq = self.rtsp_closed_seq_queue.pop(0)
@@ -403,6 +406,13 @@ class MainWindow(QMainWindow):
             self.log(
                 f"[RTSP流式][final-buffered] seq={self.rtsp_display_current_seq} text={final_text or '<empty>'}"
             )
+            return
+
+        if seq is not None:
+            seq_i = int(seq)
+            self.log(f"[RTSP流式][final-direct] seq={seq_i} text={final_text or '<empty>'}")
+            if final_text:
+                self._commit_rtsp_final_row(seq_i, final_text)
             return
 
         self.log(f"[RTSP流式][final-drop] text={final_text or '<empty>'}")
@@ -1182,7 +1192,7 @@ class MainWindow(QMainWindow):
             text = payload.get("text", "")
             seq = payload.get("seq")
             if source_label == "RTSP流式":
-                self._handle_rtsp_server_final(str(text))
+                self._handle_rtsp_server_final(str(text), seq)
                 return
             if text:
                 if seq is not None:

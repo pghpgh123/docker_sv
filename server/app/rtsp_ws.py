@@ -180,6 +180,15 @@ def _clean_final_text(text: str) -> str:
         return ""
     return cleaned
 
+
+async def _transcribe_segment(app, pcm16: bytes, sample_rate: int, final_whisper_mode: bool) -> str:
+    segment_asr = app.state.final_asr if final_whisper_mode else app.state.asr
+    try:
+        return await segment_asr.transcribe_pcm16(pcm16, sample_rate=sample_rate)
+    except Exception as exc:
+        engine_name = "final_whisper" if final_whisper_mode else "sensevoice"
+        raise RuntimeError(f"{engine_name} transcribe failed: {exc}") from exc
+
 @router.websocket("/ws/rtsp_transcribe")
 async def ws_rtsp_transcribe(ws: WebSocket):
     await ws.accept()
@@ -208,7 +217,7 @@ async def ws_rtsp_transcribe(ws: WebSocket):
         rtsp_strategy = str(msg.get("rtsp_strategy", "conservative") or "conservative").strip().lower()
         rtsp_min_rms = float(msg.get("rtsp_min_rms", settings.vad_auto_speech_rms_threshold) or 0.0)
         rtsp_min_rms = max(0.0, min(0.2, rtsp_min_rms))
-        if rtsp_strategy not in {"conservative", "adaptive", "mirror_mic"}:
+        if rtsp_strategy not in {"conservative", "adaptive", "mirror_mic", "final_whisper"}:
             rtsp_strategy = "conservative"
         print(f"[RTSP_WS] received rtsp_url={rtsp_url}")
         if not rtsp_url.startswith("rtsp://"):
@@ -218,10 +227,11 @@ async def ws_rtsp_transcribe(ws: WebSocket):
         internal_url = _map_external_to_internal(rtsp_url)
         vad = _build_segmenter(sample_rate=sample_rate, strategy=rtsp_strategy)
         mirror_mic_mode = rtsp_strategy == "mirror_mic"
+        final_whisper_mode = rtsp_strategy == "final_whisper"
         min_segment_ms = getattr(vad, "min_segment_ms", settings.vad_min_segment_ms)
         min_segment_bytes = int(sample_rate * min_segment_ms / 1000) * 2
         min_partial_bytes = int(sample_rate * settings.partial_min_audio_ms / 1000) * 2
-        if getattr(vad, "auto_adapt_enabled", False):
+        if getattr(vad, "auto_adapt_enabled", False) and not final_whisper_mode:
             tuner = _AdaptiveSplitTuner(
                 sample_rate=sample_rate,
                 frame_ms=settings.vad_frame_ms,
@@ -276,10 +286,10 @@ async def ws_rtsp_transcribe(ws: WebSocket):
                                     }
                                 )
                         continue
-                    text = await app.state.asr.transcribe_pcm16(event.pcm16, sample_rate=sample_rate)
+                    text = await _transcribe_segment(app, event.pcm16, sample_rate, final_whisper_mode)
                     if text and _is_meaningful_text(text):
                         next_seq = final_seq + 1
-                        if not mirror_mic_mode:
+                        if not mirror_mic_mode and not final_whisper_mode:
                             last_partial_text = last_partial_text_by_seq.get(next_seq, "")
                             if last_partial_seq != next_seq or last_partial_text != text:
                                 print(f"[RTSP_WS][partial-before-final][{next_seq}] {text}")
@@ -317,7 +327,9 @@ async def ws_rtsp_transcribe(ws: WebSocket):
                 now = time.monotonic()
                 active_pcm = vad.current_active_pcm()
                 if (
-                    active_pcm
+                    not final_whisper_mode
+                    and not mirror_mic_mode
+                    and active_pcm
                     and len(active_pcm) >= min_partial_bytes
                     and _pcm16_rms(active_pcm) >= rtsp_min_rms
                     and (now - last_partial_ts) >= settings.partial_interval_sec
@@ -347,10 +359,14 @@ async def ws_rtsp_transcribe(ws: WebSocket):
             for event in vad.flush():
                 if len(event.pcm16) < min_segment_bytes:
                     continue
-                text = await app.state.asr.transcribe_pcm16(event.pcm16, sample_rate=sample_rate)
+                try:
+                    text = await _transcribe_segment(app, event.pcm16, sample_rate, final_whisper_mode)
+                except RuntimeError as exc:
+                    await ws.send_json({"error": str(exc)})
+                    break
                 if text and _is_meaningful_text(text):
                     next_seq = final_seq + 1
-                    if not mirror_mic_mode:
+                    if not mirror_mic_mode and not final_whisper_mode:
                         last_partial_text = last_partial_text_by_seq.get(next_seq, "")
                         if last_partial_seq != next_seq or last_partial_text != text:
                             print(f"[RTSP_WS][flush-partial-before-final][{next_seq}] {text}")

@@ -3,6 +3,7 @@
 This project provides:
 
 - Ubuntu server (Docker): SenseVoice + VAD realtime speech-to-text
+- Optional standalone Whisper large-v3 Docker service for RTSP final-only enhancement
 - Windows client (Python GUI): microphone streaming, wav upload, realtime transcript display
 
 ## Project layout
@@ -18,8 +19,16 @@ docker_sv/
     app/
       main.py
       asr_engine.py
+      final_asr_engine.py
       vad.py
       settings.py
+  docker_whisper_large-v3/
+    docker-compose.yml
+    Dockerfile
+    app/
+      main.py
+      settings.py
+    download_model.py
   windows_client/
     app.py
     requirements.txt
@@ -39,6 +48,16 @@ docker_sv/
 cd /home/pgh/work/docker_sv
 docker compose up -d --build
 ```
+
+If you want `final_whisper` to use the standalone Whisper service, start it first:
+
+```bash
+cd /home/pgh/work/docker_sv/docker_whisper_large-v3
+docker compose up -d --build
+```
+
+The main server defaults to `http://host.docker.internal:19100` for Whisper final transcription.
+Recommended order is: start `docker_whisper_large-v3` first, wait for `/health`, then start the main `docker_sv` service.
 
 ### Check service
 
@@ -117,6 +136,15 @@ Server events:
 - `stopped`
 - `warning` / `error`
 
+### RTSP final-whisper mode
+
+- Client RTSP strategy `Whisper large-v3（仅最终文本）` maps to `rtsp_strategy=final_whisper`
+- In this mode the server suppresses partial output and only emits `final`
+- The final ASR backend can be either:
+  - standalone Whisper service via `FASTER_WHISPER_SERVICE_URL`
+  - local in-process faster-whisper model when `FASTER_WHISPER_SERVICE_URL` is empty
+- Verified path in this workspace: standalone Whisper Docker -> main `sensevoice_server` -> RTSP websocket final output
+
 ### Runtime rewrite dictionary
 
 - `GET /config/rewrite`
@@ -161,5 +189,6 @@ GUI includes:
 
 - This is an MVP for early validation.
 - If GPU memory is occupied, service auto-falls back to CPU by `SENSEVOICE_FALLBACK_TO_CPU=true`.
+- Standalone Whisper Docker uses `hf-mirror.com` by default, which works without full proxy if the host can access the mirror.
 - For production, add authentication, TLS, metrics, and request/session tracing.
 - For stronger Sichuan-accent performance, add domain hotwords and task-specific tuning data.

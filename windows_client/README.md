@@ -14,6 +14,7 @@ This client is for early-stage validation only.
 - Current session ID display and one-click query for per-session adaptive stats
 - Scrollable numbered rewrite-rule table with add/delete/edit operations
 - Dictionary import/export buttons (text format: `src=>dst`, one rule per line)
+- RTSP strategy dropdown includes `Whisper large-v3（仅最终文本）` for final-only mode
 
 ## Quick start
 
@@ -46,3 +47,12 @@ The app converts it internally to:
 - 16kHz
 - mono
 - PCM16
+
+## RTSP Whisper mode
+
+- In `RTSP音频识别` choose `Whisper large-v3（仅最终文本）`
+- This mode does not depend on partial text and focuses on final result quality
+- The backend expects the server-side standalone Whisper service or local faster-whisper backend to be available
+- The selected RTSP strategy is persisted in the client config and will be restored on next launch
+- In this mode, the important output is the final table row rather than realtime partial animation
+
